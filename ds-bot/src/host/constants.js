@@ -46,6 +46,9 @@ export const HANDOFF_ACK = 'Noted. I have my handoff note and carry on from here
 export const LATE_ANSWER = '[Late answer: the user had already given up waiting for this work; its result was settled then.]\n\n'
 // An answer from a question card, in the shape DSH's own late question replies use.
 export const REPLY_KIND = 'user-question-reply'
+// The successful ask_user execution result: the card itself is the turn's output,
+// and the answer arrives later as ordinary input.
+export const QUESTION_CARD_CONFIRMATION = 'The card is on screen; the user\'s answer arrives as their next message.'
 // DSH's snapshot of a referenced conversation, logged right after the user's message
 // that cites it.
 export const REFERENCE_KIND = 'session-reference'

@@ -5,6 +5,8 @@
 // mapped to, and the CLI's output back into stream chunks.
 import { createHash, randomUUID } from 'node:crypto'
 import { LlmAdapter, LlmError, offloadedImageText, resolveImageAttachmentAccess, textOnlyImageText } from '@deepseek-ai/dsh-llm'
+import { QUESTION_CARD_CONFIRMATION } from '../constants.js'
+import { sameQuestion } from '../question-shape.js'
 import { textOf } from '../text.js'
 import { engineOf, cliMode, signInFor } from './engines.js'
 import { LoopbackMcp } from './mcp.js'
@@ -59,6 +61,14 @@ function digestChunks(messages) {
 // Marks the one retry of a turn whose saved Claude conversation was gone.
 const RESUME_RETRIED = Symbol('resume retried')
 
+const revokeUnsurfacedCall = (live, event) => {
+  if (event.surfaced === true) return false
+  event.revoked = true
+  const at = Array.isArray(live.events) ? live.events.indexOf(event) : -1
+  if (at !== -1) live.events.splice(at, 1)
+  return live.pending.delete(event.dshCallId)
+}
+
 export class LocalAgentAdapter extends LlmAdapter {
   // deps: {rt, findExecutable, spawnEngine(kind,route,engine), record(sessionId),
   //        saveRecord, dropRecord, presetFor(sessionId), toolsFor(options), signInHint(route),
@@ -73,6 +83,8 @@ export class LocalAgentAdapter extends LlmAdapter {
     this.probes = new Map()    // route -> the probe under way
     this.sideRequests = new Set()
     this.disposed = false
+    this.questionHook = (sessionId, callId, question) => this.questionShown(sessionId, callId, question)
+    if (this.deps.rt !== undefined) this.deps.rt.localAgentQuestionShown = this.questionHook
   }
 
   providerInfo(route) {
@@ -208,6 +220,9 @@ export class LocalAgentAdapter extends LlmAdapter {
       // Output of a request DS Bot made for itself may trail its end (Devin's
       // "Context compacted"); until the next prompt, text, thoughts and activity drop.
       mute: false,
+      // A question card concluded the host-visible turn while the CLI finishes it.
+      // Events through that done are leftovers of the concluded turn.
+      discardCardTurn: false,
     }
     live.push = (event) => {
       this.observe(live, event)
@@ -333,10 +348,16 @@ export class LocalAgentAdapter extends LlmAdapter {
   stopTurn(live, reason) {
     live.state = 'idle'
     live.stopped = true
+    live.discardCardTurn = false
     live.queue.length = 0
     const stopped = live.engineSession === undefined ? undefined : live.engine.cancel?.(live.engineSession)
     live.mcp?.failAll(new Error(reason))
-    for (const pending of live.pending.values()) pending.resolve({ text: reason, isError: true })
+    for (const [dshCallId, pending] of live.pending) {
+      const event = pending.event
+      if (event !== undefined) revokeUnsurfacedCall(live, event)
+      pending.resolve({ text: reason, isError: true })
+      live.pending.delete(dshCallId)
+    }
     live.pending.clear()
     return stopped
   }
@@ -370,17 +391,63 @@ export class LocalAgentAdapter extends LlmAdapter {
     this.deps.saveRecord(sessionId, this.recordOf(live))
   }
 
+  // ask_user's successful execution concludes the DSH turn, so its tool result
+  // never comes back through the model stream. The host tells the bridge directly;
+  // the user's answer then remains ordinary later input instead of the MCP result.
+  questionShown(sessionId, callId, question) {
+    const live = this.live.get(String(sessionId))
+    if (live === undefined || typeof callId !== 'string') return
+    if (live.pending.get(callId)?.name !== 'ask_user') return
+    live.confirmedQuestionId = question.id
+    live.discardCardTurn = true
+    // A transport retry can arrive before the first execution writes its card.
+    // Settle those queued twins with the card too, before a later stream can show them.
+    for (const [pendingId, pending] of live.pending) {
+      if (pending.name !== 'ask_user' || (pendingId !== callId && !sameQuestion(question, pending.event.args))) continue
+      live.pending.delete(pendingId)
+      if (pending.event !== undefined) revokeUnsurfacedCall(live, pending.event)
+      pending.resolve({ text: QUESTION_CARD_CONFIRMATION, isError: false })
+    }
+  }
+
+  openQuestionConfirmation(live, args) {
+    const questions = this.deps.rt?.state?.questions
+    const question = this.deps.rt?.own !== undefined ? this.deps.rt.own(questions, live.sessionId) : questions?.[live.sessionId]
+    if (question === undefined || question.id !== live.confirmedQuestionId) return undefined
+    return sameQuestion(question, args) ? QUESTION_CARD_CONFIRMATION : undefined
+  }
+
   // The loopback MCP server for one live session; tools/call lands in its event queue.
   // `tools` lists the current turn's tools; the server outlives the turn that
   // started it, so tools/list reads the latest one.
   async ensureMcp(live, tools) {
     live.tools = tools
     if (live.mcp !== undefined) return live.mcp
-    const mcp = new LoopbackMcp(() => live.tools(), ({ name, arguments: args, callId }) => {
+    const mcp = new LoopbackMcp(() => live.tools(), ({ name, arguments: args, callId, onClose }) => {
+      if (name === 'ask_user') {
+        const confirmation = this.openQuestionConfirmation(live, args)
+        if (confirmation !== undefined) return Promise.resolve({ text: confirmation, isError: false })
+      }
       const dshCallId = `dsbot-${callId}`
       return new Promise((resolve) => {
-        live.pending.set(dshCallId, { name, mcpCallId: callId, resolve })
-        live.push({ type: 'call', name, args, dshCallId })
+        const event = { type: 'call', name, args, dshCallId, surfaced: false, revoked: false }
+        event.markSurfaced = () => {
+          if (event.revoked) return false
+          event.surfaced = true
+          return true
+        }
+        live.pending.set(dshCallId, { name, mcpCallId: callId, resolve, event })
+        live.push(event)
+        onClose?.(() => {
+          // A caller that went away before the turn surfaced its call cannot
+          // wait for the result: revoke the call instead of running a surprise
+          // side effect in a later turn, even if the drain already took it out
+          // of the queue but has not emitted it yet. Once surfaced, the call is
+          // already the turn's side effect and stays open for a retry.
+          if (!revokeUnsurfacedCall(live, event)) return false
+          resolve({ text: 'the call was cancelled', isError: true })
+          return true
+        })
       })
     })
     await mcp.listen()
@@ -613,6 +680,7 @@ export class LocalAgentAdapter extends LlmAdapter {
     const body = settled === undefined || settled === ''
       ? blocks
       : mergeTextBlocks([{ type: 'text', text: settled }, ...blocks])
+    if (live.discardCardTurn === true) { live.queue.push(body); return Promise.resolve() }
     if (live.state !== 'idle') {
       if (live.spec.kind === 'acp') { live.queue.push(blocks); return Promise.resolve() }
       // Steering lands on a turn that is still running. When the CLI finished the
@@ -644,7 +712,7 @@ export class LocalAgentAdapter extends LlmAdapter {
 
   discardTurnOutput(live) {
     // Requests retain their reply callbacks until surfaced and answered.
-    live.events = live.events.filter(event => event.type === 'permission' || event.type === 'call')
+    live.events = live.events.filter(event => (event.type === 'permission' || event.type === 'call') && event.revoked !== true)
   }
 
   // Codex resolves on acceptance; ACP resolves only when the entire turn ends.
@@ -749,13 +817,29 @@ export class LocalAgentAdapter extends LlmAdapter {
     try {
     for (;;) {
       const next = this.take(live)
-      const event = await Promise.race([next.event, abortPromise])
+      let event = await Promise.race([next.event, abortPromise])
         .catch(error => ({ type: 'abort', error }))
         .finally(() => next.drop())
       if (event.type === 'abort') {
         this.stopTurn(live, 'the turn was stopped')
         yield { type: 'finish', reason: { kind: 'aborted', failure: { code: 'ABORTED', message: 'the turn was stopped' } } }
         return
+      }
+      // Once a question card concluded the host-visible turn, what the CLI says
+      // while it winds that turn down is leftover output. Keep only its end; late
+      // tool and permission requests are refused instead of surfacing in the
+      // answer's turn.
+      if (live.discardCardTurn === true) {
+        if (event.type === 'permission') { event.reply(null); continue }
+        if (event.type === 'call') {
+          const pending = live.pending.get(event.dshCallId)
+          live.pending.delete(event.dshCallId)
+          pending?.resolve({ text: 'The question card ended this turn before another tool call could run.', isError: true })
+          continue
+        }
+        if (event.type !== 'done' && event.type !== 'error') continue
+        live.discardCardTurn = false
+        if (event.type === 'error') event = { type: 'done' }
       }
       // A finished turn's leftovers must not answer the turn this stream reads.
       if (event.type !== 'permission' && event.type !== 'call' && event.turnId !== undefined && live.turnTag !== undefined && event.turnId !== live.turnTag) continue
@@ -792,11 +876,16 @@ export class LocalAgentAdapter extends LlmAdapter {
         case 'usage': yield addUsage(event.usage); break
         case 'call': {
           yield* closeBlocks()
-          live.state = 'suspended'
-          // A team tool the CLI invoked over the loopback MCP server.
-          for (const chunk of emitCalls([{ name: event.name, args: event.args, dshCallId: event.dshCallId }])) yield chunk
-          yield { type: 'finish', reason: { kind: 'tool-calls' } }
-          return
+          // The handoff happens immediately before the first tool-call fragment:
+          // until then a disconnected caller can still revoke the unsurfaced call.
+          if (event.revoked !== true && event.markSurfaced?.() !== false) {
+            live.state = 'suspended'
+            // A team tool the CLI invoked over the loopback MCP server.
+            for (const chunk of emitCalls([{ name: event.name, args: event.args, dshCallId: event.dshCallId }])) yield chunk
+            yield { type: 'finish', reason: { kind: 'tool-calls' } }
+            return
+          }
+          break
         }
         case 'permission': {
           // The preset answers what it already decides, also on an agent with no
@@ -1073,6 +1162,7 @@ export class LocalAgentAdapter extends LlmAdapter {
 
   async dispose() {
     this.disposed = true
+    if (this.deps.rt?.localAgentQuestionShown === this.questionHook) delete this.deps.rt.localAgentQuestionShown
     const requests = [...this.sideRequests]
     for (const request of requests) request.controller.abort(new LlmError('the local agents adapter is disposed', 'NO_ADAPTER'))
     await Promise.all([...new Set(requests.map(request => request.engine))].map(engine => engine.close?.().catch(() => {})))

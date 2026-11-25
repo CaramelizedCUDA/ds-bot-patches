@@ -2,6 +2,7 @@
 // picks its behavior so a test can drive each branch:
 //   contains "call-tool"    -> calls the dsbot MCP server's tools/call
 //   contains "two-calls"    -> two queued MCP calls
+//   contains "retry-call"   -> cancel an MCP response, then retry the same request
 //   contains "ask-permission" -> session/request_permission to the client
 //   contains "team-permission" / "other-permission" -> an MCP call to the dsbot / another
 //                              server that asks first, in the shape cursor-agent 2026.11.05 sends
@@ -118,8 +119,28 @@ async function mcpCall(server, name, args) {
   if (server?.command !== undefined) return stdioMcpCall(server, name, args)
   const headers = { 'content-type': 'application/json', authorization: `Bearer ${server.token}` }
   const post = (body) => fetch(server.url, { method: 'POST', headers, body: JSON.stringify(body) })
-  await post({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2025-03-26', capabilities: {}, clientInfo: { name: 'fake', version: '1' } } })
+  const initialized = await post({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2025-03-26', capabilities: {}, clientInfo: { name: 'fake', version: '1' } } })
+  const sessionId = initialized.headers.get('mcp-session-id')
+  if (sessionId) headers['mcp-session-id'] = sessionId
   const response = await post({ jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name, arguments: args } })
+  const text = await response.text()
+  const line = text.split('\n').map(row => row.trim()).find(row => row.startsWith('data: ') && row.includes('"result"'))
+  return JSON.parse(line.slice(6)).result
+}
+
+async function mcpCallAfterRetry(server, name, args) {
+  if (server?.command !== undefined) return mcpCall(server, name, args)
+  const headers = { 'content-type': 'application/json', authorization: `Bearer ${server.token}` }
+  const post = (body) => fetch(server.url, { method: 'POST', headers, body: JSON.stringify(body) })
+  const initialized = await post({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2025-03-26', capabilities: {}, clientInfo: { name: 'fake', version: '1' } } })
+  const sessionId = initialized.headers.get('mcp-session-id')
+  if (sessionId) headers['mcp-session-id'] = sessionId
+  const body = { jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name, arguments: args } }
+  const first = await post(body)
+  const reader = first.body.getReader()
+  await reader.read()
+  await reader.cancel()
+  const response = await post(body)
   const text = await response.text()
   const line = text.split('\n').map(row => row.trim()).find(row => row.startsWith('data: ') && row.includes('"result"'))
   return JSON.parse(line.slice(6)).result
@@ -269,6 +290,19 @@ async function runPrompt(session, prompt, requestId) {
     if (!isTeam) { finish(`allowed via ${outcome.optionId}`); return }
     const result = await mcpCall(session.mcp, 'message_bot', { to: 'River', message: 'ping' })
     finish(`allowed via ${outcome.optionId}; tool said: ${(result.content ?? []).map(block => block.text).join('')}`)
+    return
+  }
+  if (text.includes('retry-call') || text.includes('retry-ask-user')) {
+    const asking = text.includes('retry-ask-user')
+    const name = asking ? 'ask_user' : 'message_bot'
+    const args = asking ? { question: 'Pick one?', options: [{ label: 'yes' }, { label: 'no' }] } : { to: 'Chief', message: 'hi retry' }
+    update(sessionId, { sessionUpdate: 'tool_call', toolCallId: 't1', title: `mcp dsbot ${name}`, kind: 'other', status: 'in_progress' })
+    try {
+      const result = await mcpCallAfterRetry(session.mcp, name, args)
+      finish(`tool said: ${(result.content ?? []).map(block => block.text).join('')}`)
+    } catch (error) {
+      finish(`tool failed: ${error.message}`)
+    }
     return
   }
   if (text.includes('call-tool') || text.includes('two-calls')) {

@@ -3,10 +3,11 @@
 import { randomUUID } from 'node:crypto'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import { readAvatar } from './avatar.js'
-import { COLORS, EXTRA_COLORS, MESSAGE_INLINE_MAX, ROOM_MODES, SOURCE_KIND, TEXT_KEPT } from './constants.js'
+import { COLORS, EXTRA_COLORS, MESSAGE_INLINE_MAX, QUESTION_CARD_CONFIRMATION, ROOM_MODES, SOURCE_KIND, TEXT_KEPT } from './constants.js'
 import { within } from './folders.js'
 import { missingFileRefs } from './claims.js'
 import { absoluteLinks } from './links.js'
+import { questionShape } from './question-shape.js'
 import { NAME_MAX } from './requests.js'
 import { unquote } from './text.js'
 import { ownChatSessions } from './threads.js'
@@ -935,33 +936,31 @@ export function install(rt) {
       if (owner !== undefined && !rt.roomHasImOrigin?.(owner.roomId)) return 'Question cards only work in your own chat. In a group, ask in your message instead.'
       if (owner !== undefined && args.allowCustom === true) return 'Group question cards accept listed choices only. Call ask_user with allowCustom: false, or ask for free text in your message instead.'
       if (owner === undefined && !rt.chatOwners.has(id)) return `Only Bots on the team can use ask_user. Use ${BLOCKING_QUESTION_TOOL} if it is available in this session, or ask the user in your reply.`
-      const options = (Array.isArray(args.options) ? args.options : [])
-        .map(option => (typeof option === 'string' ? { label: option } : option ?? {}))
-        .map(option => ({
-          label: String(option.label ?? '').trim(),
-          ...(option.description ? { description: String(option.description).trim() } : {}),
-        }))
-        .filter(option => option.label !== '')
-        .slice(0, 6)
+      const shape = questionShape(args)
+      const options = shape.options
       if (options.length === 0) return 'Give at least one option.'
-      state.questions[id] = {
+      const question = {
         id: randomUUID(),
         ...(exec.callId ? { callId: exec.callId } : {}),
-        question: String(args.question ?? '').trim(),
-        ...(args.detail ? { detail: String(args.detail).trim() } : {}),
+        question: shape.question,
+        ...(shape.detail ? { detail: shape.detail } : {}),
         options,
-        multiSelect: args.multiSelect === true,
-        ...(args.allowCustom === true ? { allowCustom: true } : {}),
+        multiSelect: shape.multiSelect,
+        ...(shape.allowCustom ? { allowCustom: true } : {}),
         ...(owner === undefined ? {} : { imOrigin: rt.captureImOrigin?.(rt.roomOf(owner.roomId)?.sessionId ?? owner.roomId) }),
         askedAt: Date.now(),
       }
+      state.questions[id] = question
       if (owner !== undefined) {
-        rt.logRoom(rt.roomOf(owner.roomId), { who: rt.botOf(owner.botId).name, botId: owner.botId, questionId: state.questions[id].id, text: `Asked: ${state.questions[id].question}\n${options.map((option, index) => `${index + 1}. ${option.label}`).join('\n')}` })
+        rt.logRoom(rt.roomOf(owner.roomId), { who: rt.botOf(owner.botId).name, botId: owner.botId, questionId: question.id, text: `Asked: ${question.question}\n${options.map((option, index) => `${index + 1}. ${option.label}`).join('\n')}` })
       }
       await rt.save()
-      rt.cardShown?.(id, 'question', state.questions[id].question)
+      rt.cardShown?.(id, 'question', question.question)
+      // A concluded tool result never re-enters the local-agent model stream, so
+      // the loopback bridge hears the card directly and can answer its MCP call.
+      rt.localAgentQuestionShown?.(id, exec.callId, question)
       exec.concludeTurn?.()
-      return 'The card is on screen; the user\'s answer arrives as their next message.'
+      return QUESTION_CARD_CONFIRMATION
     },
   }))
 
