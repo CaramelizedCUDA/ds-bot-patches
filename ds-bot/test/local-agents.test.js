@@ -15,7 +15,7 @@ import { cleanEnv } from '../src/host/local-agents/discover.js'
 import { ENGINES, validateCustom, isLocalAgentRoute, cliMode, acpMode } from '../src/host/local-agents/engines.js'
 import { AGENT_BADGES, agentAvatar, badgeOf, isLocalRoute } from '../src/client/agent-routes.js'
 import { INKS } from '../src/client/inks.js'
-import { install as partsInstall } from '../src/host/parts.js'
+import { handoffReply, install as partsInstall, questionReply } from '../src/host/parts.js'
 import { install as modelsInstall } from '../src/host/models.js'
 import { fakeContext } from './fake-ctx.js'
 
@@ -1198,6 +1198,83 @@ test('codex app-server: the approval answer rides along with runtime context in 
   const text = (last?.params?.input ?? []).map(item => item.text ?? '').join('\n')
   assert.match(text, /\{"decision":"allow"\}/, `the decision reached the turn: ${text}`)
   assert.match(text, /workspace note: the folder is \/team/, `the context reached the turn: ${text}`)
+})
+
+test('acp discardCardTurn: a valid toolCallId result sends once both without and with extra input', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsb-acp-discard-'))
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+
+  // Without runtime context or extra user input: continuation carries the settled result once.
+  const withoutPath = join(dir, 'without.jsonl')
+  const adapterWithout = makeAdapter({ acpArgs: [`--record=${withoutPath}`] })
+  t.after(() => adapterWithout.dispose())
+  const initWithout = [user('m1', 'please call-tool now')]
+  const firstWithout = await collect(adapterWithout.stream(options('s1', initWithout)))
+  assert.equal(firstWithout.calls.length, 1)
+  adapterWithout.live.get('s1').discardCardTurn = true
+  const secondWithout = await collect(adapterWithout.stream(options('s1', [
+    ...initWithout,
+    toolResult('t1', firstWithout.calls[0].id, 'settled-only-result'),
+  ])))
+  const promptsWithout = readFileSync(withoutPath, 'utf8').trim().split('\n').filter(Boolean).map(line => JSON.parse(line)).filter(entry => entry.event === 'prompt')
+  assert.equal(promptsWithout.length, 2, `expected 1 initial + 1 continuation prompt, got ${promptsWithout.length}: ${JSON.stringify(promptsWithout)}`)
+  assert.match(promptsWithout[1].text, /settled-only-result/)
+  assert.match(secondWithout.text, /^ok: The calls that were waiting on the user are settled/)
+
+  // With runtime context (and user input): discardCardTurn queue carries settled + blocks once, not twice.
+  const withPath = join(dir, 'with.jsonl')
+  const adapterWith = makeAdapter({ acpArgs: [`--record=${withPath}`] })
+  t.after(() => adapterWith.dispose())
+  const initWith = [user('m1', 'please call-tool now')]
+  const firstWith = await collect(adapterWith.stream(options('s1', initWith)))
+  assert.equal(firstWith.calls.length, 1)
+  adapterWith.live.get('s1').discardCardTurn = true
+  const context = { id: 'c1', role: 'user', content: [{ type: 'text', text: 'workspace note: /team' }], source: { kind: 'runtime-context' } }
+  const secondWith = await collect(adapterWith.stream(options('s1', [
+    ...initWith,
+    toolResult('t1', firstWith.calls[0].id, 'settled-with-context'),
+    context,
+    user('m2', 'carry on'),
+  ])))
+  const promptsWith = readFileSync(withPath, 'utf8').trim().split('\n').filter(Boolean).map(line => JSON.parse(line)).filter(entry => entry.event === 'prompt')
+  assert.equal(promptsWith.length, 2, `expected 1 initial + 1 queued prompt, got ${promptsWith.length}: ${JSON.stringify(promptsWith)}`)
+  assert.match(promptsWith[1].text, /settled-with-context/)
+  assert.match(promptsWith[1].text, /workspace note: \/team/)
+  assert.match(promptsWith[1].text, /carry on/)
+  assert.equal((secondWith.text.match(/ok: /g) ?? []).length, 1, `expected single reply, got: ${secondWith.text}`)
+})
+
+test('ask_user replies match only their own pending callId while browser_handoff card replies keep working', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsb-ask-attr-'))
+  const recordPath = join(dir, 'record.jsonl')
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  const adapter = makeAdapter({ acpArgs: [`--record=${recordPath}`] })
+  t.after(() => adapter.dispose())
+
+  const base = [user('m1', 'hello')]
+  await collect(adapter.stream(options('s1', base)))
+  const live = adapter.live.get('s1')
+
+  // 1. An unconfirmed ask_user behind another call resolves only the matching callId.
+  const wrongResolved = []
+  const askResolved = []
+  live.pending.set('other-1', { name: 'read_own_chat', resolve: res => wrongResolved.push(res) })
+  live.pending.set('ask-1', { name: 'ask_user', resolve: res => askResolved.push(res), event: { surfaced: true } })
+  const builtAsk1 = questionReply({ id: 'q1', callId: 'ask-1', question: 'Ready?', options: [{ label: 'Yes' }, { label: 'No' }] }, { selected: ['Yes'] })
+  const msgAsk1 = { id: 'm2', role: 'user', content: [{ type: 'text', text: builtAsk1.text }], source: builtAsk1.source }
+  await collect(adapter.stream(options('s1', [...base, msgAsk1])))
+  assert.equal(wrongResolved.length, 0, 'unrelated pending call did not claim ask_user reply')
+  assert.equal(askResolved.length, 1, 'matching pending ask_user received its reply')
+  live.pending.clear()
+
+  // 2. browser_handoff shares source.kind === user-question-reply with a different payload and still resolves.
+  const handoffResolved = []
+  live.pending.set('bh-mcp', { name: 'browser_handoff', resolve: res => handoffResolved.push(res), event: { surfaced: true } })
+  const builtHandoff = handoffReply({ callId: 'bh-card', reason: 'Sign in' }, 'done')
+  const msgHandoff = { id: 'm3', role: 'user', content: [{ type: 'text', text: builtHandoff.text }], source: builtHandoff.source }
+  await collect(adapter.stream(options('s1', [...base, msgAsk1, msgHandoff])))
+  assert.equal(handoffResolved.length, 1, 'browser_handoff card reply still resolved its pending call')
+  assert.match(handoffResolved[0].text, /answer_to_pending_handoff/)
 })
 
 test('codex app-server: a steer names the turn it steers, and a finished turn cannot be steered', async (t) => {

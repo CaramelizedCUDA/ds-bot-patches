@@ -23,7 +23,7 @@
 // `--cursor-modes` lists the modes cursor-agent 2026.11.05 does (agent, plan, ask)
 // and refuses any other, as it does.
 import { spawn } from 'node:child_process'
-import { readFileSync, writeFileSync } from 'node:fs'
+import { appendFileSync, readFileSync, writeFileSync } from 'node:fs'
 import { createInterface } from 'node:readline'
 
 const exitAfterTurn = process.argv.includes('--exit-after-turn')
@@ -37,6 +37,7 @@ const loadThoughtLevel = process.argv.includes('--load-thought-level')
 const modelResetsThought = process.argv.includes('--model-resets-thought')
 const preserveThoughtOnModel = process.argv.includes('--preserve-thought-on-model')
 const stateFile = process.argv.find(arg => arg.startsWith('--state-file='))?.slice('--state-file='.length)
+const recordFile = process.argv.find(arg => arg.startsWith('--record='))?.slice('--record='.length)
 const omitMcpCaps = process.argv.includes('--omit-mcp-caps')
 const rejectHttpMcp = process.argv.includes('--reject-http-mcp')
 const rejectMcp = process.argv.includes('--reject-mcp')
@@ -292,6 +293,22 @@ async function runPrompt(session, prompt, requestId) {
     finish(`allowed via ${outcome.optionId}; tool said: ${(result.content ?? []).map(block => block.text).join('')}`)
     return
   }
+  if (text.includes('ask-user-late-read')) {
+    const args = { question: 'Approve ACP042?', options: [{ label: 'Pass' }, { label: 'Fail' }] }
+    update(sessionId, { sessionUpdate: 'tool_call', toolCallId: 't-ask', title: 'mcp dsbot ask_user', kind: 'other', status: 'in_progress' })
+    try {
+      if (text.includes('prior-read')) await mcpCall(session.mcp, 'read_own_chat', {})
+      const cardRes = await mcpCall(session.mcp, 'ask_user', args)
+      const lateRes = await mcpCall(session.mcp, 'read_own_chat', {})
+      if (recordFile) {
+        appendFileSync(recordFile, `${JSON.stringify({ event: 'late-read', sessionId, isError: lateRes?.isError === true, text: (lateRes?.content ?? []).map(block => block.text ?? '').join('') })}\n`)
+      }
+      finish(`card turn trailing: ${(cardRes?.content ?? []).map(block => block.text ?? '').join('')}`)
+    } catch (error) {
+      finish(`card turn failed: ${error.message}`)
+    }
+    return
+  }
   if (text.includes('retry-call') || text.includes('retry-ask-user')) {
     const asking = text.includes('retry-ask-user')
     const name = asking ? 'ask_user' : 'message_bot'
@@ -453,6 +470,10 @@ process.stdin.on('data', (chunk) => {
         else { sessions.get(params.sessionId).model = params.modelId; saveSaved(); reply(id, {}) }
         break
       case 'session/prompt':
+        if (recordFile) {
+          const promptText = (params.prompt ?? []).filter(block => block.type === 'text').map(block => block.text ?? '').join('\n')
+          appendFileSync(recordFile, `${JSON.stringify({ event: 'prompt', sessionId: params.sessionId, id, text: promptText })}\n`)
+        }
         if (lateCancelReply) {
           const session = sessions.get(params.sessionId)
           if (session?.pendingPrompt !== undefined) {

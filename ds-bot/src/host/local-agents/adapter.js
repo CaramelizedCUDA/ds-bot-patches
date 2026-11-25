@@ -5,7 +5,7 @@
 // mapped to, and the CLI's output back into stream chunks.
 import { createHash, randomUUID } from 'node:crypto'
 import { LlmAdapter, LlmError, offloadedImageText, resolveImageAttachmentAccess, textOnlyImageText } from '@deepseek-ai/dsh-llm'
-import { QUESTION_CARD_CONFIRMATION } from '../constants.js'
+import { QUESTION_CARD_CONFIRMATION, REPLY_KIND } from '../constants.js'
 import { sameQuestion } from '../question-shape.js'
 import { textOf } from '../text.js'
 import { engineOf, cliMode, signInFor } from './engines.js'
@@ -67,6 +67,22 @@ const revokeUnsurfacedCall = (live, event) => {
   const at = Array.isArray(live.events) ? live.events.indexOf(event) : -1
   if (at !== -1) live.events.splice(at, 1)
   return live.pending.delete(event.dshCallId)
+}
+
+function askUserReplyCallId(message) {
+  const source = message.source
+  if (source?.kind !== REPLY_KIND || source.outcome !== 'answered') return undefined
+  if (typeof source.callId !== 'string' || source.callId === '') return undefined
+  if (!Array.isArray(message.content) || message.content.length !== 1) return undefined
+  const [block] = message.content
+  if (block?.type !== 'text' || typeof block.text !== 'string') return undefined
+  try {
+    const payload = JSON.parse(block.text)
+    if (payload?.kind !== 'answer_to_pending_question' || payload.tool !== 'ask_user') return undefined
+    return payload.callId === source.callId ? source.callId : undefined
+  } catch {
+    return undefined
+  }
 }
 
 export class LocalAgentAdapter extends LlmAdapter {
@@ -349,6 +365,7 @@ export class LocalAgentAdapter extends LlmAdapter {
     live.state = 'idle'
     live.stopped = true
     live.discardCardTurn = false
+    live.continuation = undefined
     live.queue.length = 0
     const stopped = live.engineSession === undefined ? undefined : live.engine.cancel?.(live.engineSession)
     live.mcp?.failAll(new Error(reason))
@@ -400,6 +417,7 @@ export class LocalAgentAdapter extends LlmAdapter {
     if (live.pending.get(callId)?.name !== 'ask_user') return
     live.confirmedQuestionId = question.id
     live.discardCardTurn = true
+    live.continuation = undefined
     // A transport retry can arrive before the first execution writes its card.
     // Settle those queued twins with the card too, before a later stream can show them.
     for (const [pendingId, pending] of live.pending) {
@@ -501,19 +519,30 @@ export class LocalAgentAdapter extends LlmAdapter {
       .map(message => textOf(message.content)).filter(text => text !== '').join('\n')
     const users = delta.filter(message => message.role === 'user' && message.source?.kind !== 'runtime-context')
     // The first open bridged call that is not an approval may take the user's
-    // next message as its answer; the rest of the input is new.
-    const openCall = [...live.pending.entries()].find(([, entry]) => entry.name !== APPROVE_TOOL)
+    // next message as its answer; the rest of the input is new. An ask_user card
+    // reply names its own callId and never falls back to an unrelated call; calls
+    // that have not surfaced yet cannot be waiting on the user.
     const remaining = []
-    let answered = openCall === undefined
+    let answered = false
     for (const message of users) {
-      if (!answered && openCall !== undefined) {
-        const [id, pending] = openCall
+      let matched
+      if (!answered) {
+        const askCallId = askUserReplyCallId(message)
+        if (askCallId !== undefined) {
+          const pending = live.pending.get(askCallId)
+          if (pending?.name === 'ask_user' && pending.event?.surfaced !== false) matched = [askCallId, pending]
+        } else {
+          matched = [...live.pending.entries()].find(([, entry]) => entry.name !== APPROVE_TOOL && entry.event?.surfaced !== false)
+        }
+      }
+      if (matched !== undefined) {
+        const [id, pending] = matched
         live.pending.delete(id)
         const answer = textOf(message.content)
         pending.resolve({ text: answer })
         // The CLI may have finished while this call waited; the answer is then a
         // settled result the turn below has to carry, like a tool result (#1513).
-        settled.push({ name: openCall[1].name, text: answer, isError: false })
+        settled.push({ name: pending.name, text: answer, isError: false })
         answered = true
       } else {
         remaining.push(message)
@@ -615,13 +644,14 @@ export class LocalAgentAdapter extends LlmAdapter {
       // message — because context alone would carry the turn without the decision.
       const blocks = mergeTextBlocks([{ type: 'text', text: settledText }, ...promptBlocks])
       this.discardTurnOutput(live)
+      live.continuation = undefined
       if (sentInstructions) live.promptHash = promptHash
       promptBlocks = []
       await this.startTurn(live, blocks, options.signal, options.reasoningEffort)
-    } else if (settledText !== '') {
+    } else {
       // The turn still looks alive; if it ends without reading the answer, the drain
-      // starts the turn that carries it.
-      live.continuation = settledText
+      // starts the turn that carries it, unless discardCardTurn queues it with input below.
+      live.continuation = settledText !== '' && !(live.discardCardTurn === true && promptBlocks.length > 0) ? settledText : undefined
     }
     if (promptBlocks.length > 0) {
       await this.sendInput(live, promptBlocks, options.signal, options.reasoningEffort, settledText)
@@ -680,7 +710,10 @@ export class LocalAgentAdapter extends LlmAdapter {
     const body = settled === undefined || settled === ''
       ? blocks
       : mergeTextBlocks([{ type: 'text', text: settled }, ...blocks])
-    if (live.discardCardTurn === true) { live.queue.push(body); return Promise.resolve() }
+    if (live.discardCardTurn === true) {
+      live.queue = [mergeTextBlocks([...live.queue.flat(), ...body])]
+      return Promise.resolve()
+    }
     if (live.state !== 'idle') {
       if (live.spec.kind === 'acp') { live.queue.push(blocks); return Promise.resolve() }
       // Steering lands on a turn that is still running. When the CLI finished the
@@ -879,6 +912,7 @@ export class LocalAgentAdapter extends LlmAdapter {
           // The handoff happens immediately before the first tool-call fragment:
           // until then a disconnected caller can still revoke the unsurfaced call.
           if (event.revoked !== true && event.markSurfaced?.() !== false) {
+            live.continuation = undefined
             live.state = 'suspended'
             // A team tool the CLI invoked over the loopback MCP server.
             for (const chunk of emitCalls([{ name: event.name, args: event.args, dshCallId: event.dshCallId }])) yield chunk
@@ -893,6 +927,7 @@ export class LocalAgentAdapter extends LlmAdapter {
           const answer = presetAnswer(this.deps.presetFor(live.sessionId), event)
           if (answer !== undefined) { event.reply(answer); break }
           yield* closeBlocks()
+          live.continuation = undefined
           live.state = 'suspended'
           // The CLI's own permission prompt, bridged as an approval tool call.
           const call = { name: APPROVE_TOOL, args: { action: event.action, ...(event.detail ? { detail: event.detail } : {}) }, dshCallId: event.id }
