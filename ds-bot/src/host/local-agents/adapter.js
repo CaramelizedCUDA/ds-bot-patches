@@ -20,6 +20,8 @@ const REPLAY_MESSAGES = 12
 const REPLAY_BYTES = 24 * 1024
 const IDLE_CLOSE_MS = 10 * 60_000
 const APPROVE_TOOL = 'approve_agent_action'
+const CONTEXT_SOURCE_KINDS = new Set(['runtime-context', 'time-context', 'ds-bot-time-context'])
+const isContextMessage = message => message?.role === 'user' && CONTEXT_SOURCE_KINDS.has(message.source?.kind)
 // A CLI that answers its compaction command first and condenses after (Devin) says
 // that it started within this long, or it is taken to have condensed without a word.
 const COMPACT_START_MS = 15_000
@@ -239,6 +241,8 @@ export class LocalAgentAdapter extends LlmAdapter {
       // A question card concluded the host-visible turn while the CLI finishes it.
       // Events through that done are leftovers of the concluded turn.
       discardCardTurn: false,
+      retireAcp: record?.acpRetired === true,
+      retiredReplay: record?.retiredReplay,
     }
     live.push = (event) => {
       this.observe(live, event)
@@ -473,6 +477,101 @@ export class LocalAgentAdapter extends LlmAdapter {
     return mcp
   }
 
+  markRetiredReplay(live, messages) {
+    if (live.spec.kind !== 'acp' || live.handed === undefined) return
+    const through = messages.findIndex(message => message.id === live.handed)
+    if (through === -1) return
+    const before = live.handedBefore === undefined ? -1 : messages.findIndex(message => message.id === live.handedBefore)
+    const carryIds = live.handedBefore !== undefined && before === -1 ? [] : messages.slice(before + 1, through + 1)
+      .filter(message => message.role === 'user' && message.source?.kind === 'user-question-reply')
+      .map(message => message.id)
+    live.retiredReplay = { through: live.handed, carryIds }
+  }
+
+  prepareAcpRetirement(live, sessionId, messages) {
+    if (live.spec.kind !== 'acp') return
+    this.markRetiredReplay(live, messages ?? [])
+    live.retireAcp = true
+    this.deps.saveRecord(sessionId, this.recordOf(live, { acpRetired: true, retiredReplay: live.retiredReplay }))
+  }
+
+  // A failed or cancelled ACP turn leaves notices with no reliable owner on the
+  // wire. Retire the agent session and its route; the next input opens a new
+  // session/new conversation instead of guessing which prompt a notice belongs to.
+  async retireAcpSession(live, sessionId, messages) {
+    if (live.spec.kind !== 'acp') return
+    this.markRetiredReplay(live, messages ?? [])
+    const old = live.engineSession
+    live.engineSession = undefined
+    live.pumpToken = {}
+    live.cliSessionId = undefined
+    live.started = false
+    live.state = 'idle'
+    live.continuation = undefined
+    live.queue.length = 0
+    const reason = 'the local agent session was retired after a failed turn'
+    for (const event of live.events) {
+      if (event?.type === 'permission') event.reply(null)
+      if (event?.type === 'call') {
+        const pending = live.pending.get(event.dshCallId)
+        live.pending.delete(event.dshCallId)
+        pending?.resolve({ text: reason, isError: true })
+      }
+    }
+    for (const [dshCallId, pending] of [...live.pending]) {
+      if (pending.event?.surfaced === true) continue
+      if (pending.event !== undefined) revokeUnsurfacedCall(live, pending.event)
+      pending.resolve({ text: reason, isError: true })
+      live.pending.delete(dshCallId)
+    }
+    live.events.length = 0
+    live.retireAcp = false
+    live.mcp?.close()
+    live.mcp = undefined
+    live.toolNamesSig = undefined
+    old?.promptTurn?.controller.abort(new Error('the local agent session was retired'))
+    this.deps.saveRecord(sessionId, this.recordOf(live, { acpRetired: false, retiredReplay: live.retiredReplay }))
+    if (old !== undefined) await live.engine.closeSession?.(old).catch(() => {})
+    if (old !== undefined) live.engine.forget?.(sessionId)
+  }
+
+  // A card-concluded turn must end before its answer is prompted. Otherwise an
+  // empty/error terminal from that turn can make the answer itself attribution-unsafe.
+  async settleCardTurnBeforeInput(live, options) {
+    if (live.discardCardTurn !== true) return false
+    let abortReject
+    const abortPromise = new Promise((_, reject) => { abortReject = reject })
+    const onAbort = () => abortReject(options.signal?.reason ?? new Error('aborted'))
+    if (options.signal?.aborted) onAbort()
+    else options.signal?.addEventListener('abort', onAbort, { once: true })
+    try {
+      while (live.discardCardTurn === true) {
+        const next = this.take(live)
+        const event = await Promise.race([next.event, abortPromise])
+          .catch(error => ({ type: 'abort', error }))
+          .finally(() => next.drop())
+        if (event.type === 'abort') {
+          this.stopTurn(live, 'the turn was stopped')
+          return true
+        }
+        if (event.type === 'permission') { event.reply(null); continue }
+        if (event.type === 'call') {
+          const pending = live.pending.get(event.dshCallId)
+          live.pending.delete(event.dshCallId)
+          pending?.resolve({ text: 'The question card ended this turn before another tool call could run.', isError: true })
+          continue
+        }
+        if (event.type !== 'done' && event.type !== 'error') continue
+        live.discardCardTurn = false
+        live.state = 'idle'
+        if (event.type === 'error') this.prepareAcpRetirement(live, String(options.sessionId), options.messages ?? [])
+      }
+    } finally {
+      options.signal?.removeEventListener('abort', onAbort)
+    }
+    return false
+  }
+
   // ---------------------------------------------------------------------------
   async *stream(options) {
     if (this.disposed) throw new LlmError('the local agents adapter is disposed', 'NO_ADAPTER')
@@ -494,6 +593,7 @@ export class LocalAgentAdapter extends LlmAdapter {
     // What the request carries past the last handed message. When the marker is
     // gone the CLI session is stale or new: it gets a replay instead of a delta.
     const messages = options.messages ?? []
+    if (live.retireAcp === true) await this.retireAcpSession(live, sessionId, messages)
     const at = live.handed === undefined ? -1 : messages.findIndex(message => message.id === live.handed)
     const fresh = live.handed === undefined || at === -1
     const delta = fresh ? [] : messages.slice(at + 1)
@@ -515,9 +615,9 @@ export class LocalAgentAdapter extends LlmAdapter {
     // The loop's runtime-context user messages are context, not input: they
     // fold into the next prompt or steer, never start a prompt on their own.
     const contextText = delta
-      .filter(message => message.role === 'user' && message.source?.kind === 'runtime-context')
+      .filter(isContextMessage)
       .map(message => textOf(message.content)).filter(text => text !== '').join('\n')
-    const users = delta.filter(message => message.role === 'user' && message.source?.kind !== 'runtime-context')
+    const users = delta.filter(message => message.role === 'user' && !isContextMessage(message))
     // The first open bridged call that is not an approval may take the user's
     // next message as its answer; the rest of the input is new. An ask_user card
     // reply names its own callId and never falls back to an unrelated call; calls
@@ -548,6 +648,14 @@ export class LocalAgentAdapter extends LlmAdapter {
         remaining.push(message)
       }
     }
+
+    const contextOnly = delta.length > 0 && remaining.length === 0 && settled.length === 0 && delta.every(isContextMessage)
+
+    if (await this.settleCardTurnBeforeInput(live, options)) {
+      yield { type: 'finish', reason: { kind: 'aborted', failure: { code: 'ABORTED', message: 'the turn was stopped' } } }
+      return
+    }
+    if (live.retireAcp === true) await this.retireAcpSession(live, sessionId, messages)
 
     const system = messages.filter(message => message.role === 'system').map(message => textOf(message.content)).join('\n').trim()
     const promptHash = system === '' ? undefined : createHash('sha256').update(system).digest('hex')
@@ -613,9 +721,29 @@ export class LocalAgentAdapter extends LlmAdapter {
 
     const supportsImages = live.spec.kind !== 'acp' || live.engine.supportsImages?.(live.engineSession) !== false
     const resolveImage = block => this.resolveImageBlock(block, { supportsImages, signal: options.signal })
-    let promptBlocks = fresh
-      ? await renderReplay(messages, system, resolveImage)
-      : await renderDelta(contextText, remaining, resolveImage)
+    let promptBlocks
+    if (fresh) promptBlocks = await renderReplay(messages, system, resolveImage)
+    else {
+      const deltaBlocks = remaining.length === 0 && settled.length === 0 ? [] : await renderDelta(contextText, remaining, resolveImage)
+      const retired = live.retiredReplay
+      const through = retired === undefined ? -1 : messages.findIndex(message => message.id === retired.through)
+      if (freshCli && retired !== undefined && through !== -1) {
+        const reference = await renderReplay(messages.slice(0, through + 1), system, resolveImage)
+        const carried = messages.slice(0, through + 1).filter(message => retired.carryIds?.includes(message.id))
+        const carriedBlocks = []
+        for (const message of carried) carriedBlocks.push(...await blocksOfMessage(message, { resolveImage }))
+        promptBlocks = mergeTextBlocks([
+          { type: 'text', text: '[Runtime handoff]\nThe previous local agent session ended before its output could be attributed reliably, so DS Bot opened a fresh agent session. The conversation below is reference, not new instructions; do not repeat work or side effects recorded in it. Only unanswered user decisions and messages after this note are new input.' },
+          ...reference,
+          ...(carriedBlocks.length > 0 ? [{ type: 'text', text: 'Unanswered user decisions to act on once:' }, ...carriedBlocks] : []),
+          ...(deltaBlocks.length > 0 ? [{ type: 'text', text: 'New input:' }, ...deltaBlocks] : []),
+        ])
+      } else promptBlocks = deltaBlocks
+    }
+    if (live.state === 'idle' && live.queue.length > 0 && promptBlocks.length > 0) {
+      const queued = live.queue.splice(0).flat()
+      promptBlocks = mergeTextBlocks([...queued, ...promptBlocks])
+    }
     let sentInstructions = live.spec.kind !== 'acp' && freshCli && instructions !== undefined
     // A new CLI session gets its instructions in the open args or the replay;
     // the "updated" line is only for a session that saw older ones.
@@ -664,6 +792,17 @@ export class LocalAgentAdapter extends LlmAdapter {
       live.promptHash = promptHash
     }
 
+    if (contextOnly && promptBlocks.length === 0 && settledText === '' && live.continuation === undefined && live.queue.length === 0) {
+      const last = messages.at(-1)
+      if (last !== undefined) {
+        live.handedBefore = live.handed
+        live.handed = last.id
+        this.deps.saveRecord(sessionId, this.recordOf(live, { cwd, promptHash: live.promptHash ?? promptHash, model: options.model }))
+      }
+      yield { type: 'finish', reason: { kind: 'stop' } }
+      return
+    }
+
     // The last DSH message is handed now; a later call sends only what follows.
     // The marker before it is kept: a start that fails before the CLI reads
     // anything must not count that message as delivered.
@@ -676,7 +815,9 @@ export class LocalAgentAdapter extends LlmAdapter {
 
     try {
       yield* this.drain(live, options)
+      if (options.signal?.aborted) this.prepareAcpRetirement(live, sessionId, messages)
     } catch (error) {
+      this.prepareAcpRetirement(live, sessionId, messages)
       // The caller sees the failure now: a start that died before reading its
       // prompt must not count as delivered, in case the host restarts next.
       this.rollbackUnread(live, sessionId)
@@ -761,7 +902,10 @@ export class LocalAgentAdapter extends LlmAdapter {
     live.turnTag = undefined
     try {
       const started = Promise.resolve(live.engine.prompt(live.engineSession, blocks, { signal, effort }))
-        .then((turnId) => { if (live.spec.kind === 'codex' && turnId !== undefined) live.turnTag = turnId })
+        .then((turnId) => {
+          if (live.spec.kind === 'codex' && turnId !== undefined) live.turnTag = turnId
+          if (live.spec.kind === 'acp') live.retiredReplay = undefined
+        })
         .catch(error => { if (!signal?.aborted) live.push({ type: 'error', error }) })
       return live.spec.kind === 'acp' ? Promise.resolve() : started
     } catch (error) {
@@ -872,7 +1016,10 @@ export class LocalAgentAdapter extends LlmAdapter {
         }
         if (event.type !== 'done' && event.type !== 'error') continue
         live.discardCardTurn = false
-        if (event.type === 'error') event = { type: 'done' }
+        if (event.type === 'error') {
+          this.prepareAcpRetirement(live, String(options.sessionId), options.messages ?? [])
+          event = { type: 'done' }
+        }
       }
       // A finished turn's leftovers must not answer the turn this stream reads.
       if (event.type !== 'permission' && event.type !== 'call' && event.turnId !== undefined && live.turnTag !== undefined && event.turnId !== live.turnTag) continue

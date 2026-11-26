@@ -580,7 +580,10 @@ export class AcpEngine {
       if (session.promptTurn === turn) session.running = false
       signal?.removeEventListener('abort', onAbort)
     })
-    return reply.catch((error) => { if (!turn.cancelled) throw error })
+    // Errors from `session/prompt` are already delivered in FIFO order through
+    // `session.push({ type: 'error', error })` above; re-throwing here would let
+    // callers push a duplicate error ahead of already-queued `session/update` events.
+    return reply.catch(() => {})
   }
 
   canSteer(session) {

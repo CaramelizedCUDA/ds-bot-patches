@@ -179,7 +179,9 @@ test('real DSH concludeTurn confirms ask_user and delivers the card answer as th
   assert.equal(agent.session.snapshotEvents().filter(event => event.type === 'tool/call' && event.data?.name === 'ask_user').length, 2)
 })
 
-test('answering ask_user with a late read_own_chat and runtime context sends one ACP prompt and one reply block', async (t) => {
+async function recordedAskUserLoop(t) {
+  const archived = []
+  const lastRequest = new Map()
   const home = mkdtempSync(join(tmpdir(), 'ds-bot-local-ask-late-'))
   const workDir = join(home, 'team')
   const recordPath = join(home, 'acp-record.jsonl')
@@ -216,9 +218,13 @@ test('answering ask_user with a late read_own_chat and runtime context sends one
         list: () => [{ id: 'w1', path: workDir }],
         resolveByPath: async () => ({ id: 'w1', path: workDir }),
         create: async path => ({ id: 'w1', path }),
-        archiveSession: async () => {},
+        archiveSession: async sessionId => { archived.push(sessionId) },
       },
       sessionController: {
+        create: async () => {
+          const fresh = await root.agentLoop.create(SessionId('s2'), { provider: 'local-acp-fake', model: 'default', cwd: workDir })
+          return { sessionId: fresh.id }
+        },
         resolveAgent: async sessionId => ({ agent: root.agents.get(sessionId) }),
         selectModel: async () => {},
         page: async () => ({ records: [], hasMore: false }),
@@ -247,6 +253,10 @@ test('answering ask_user with a late read_own_chat and runtime context sends one
       for (const listener of ctx.listeners.get(name) ?? []) listener(payload)
     })
   }
+  root.on('llm/stream', (options, next) => {
+    if (options.provider === 'local-acp-fake') lastRequest.set(options.sessionId, options)
+    return next()
+  })
   let turnNumber = 0
   root.on('agent/pre-step', async (payload, next) => {
     const chain = ctx.listeners.get('agent/pre-step') ?? []
@@ -283,6 +293,13 @@ test('answering ask_user with a late read_own_chat and runtime context sends one
   })
   await rt.resolveAgent('s1')
 
+  const readRecords = () => readFileSync(recordPath, 'utf8').trim().split('\n').filter(Boolean).map(line => JSON.parse(line))
+  return { agent, rt, ctx, adapter, archived, readRecords, lastRequest }
+}
+
+test('answering ask_user with a late read_own_chat and runtime context sends one ACP prompt and one reply block', async (t) => {
+  const { agent, rt, adapter, readRecords } = await recordedAskUserLoop(t)
+
   agent.followup(createUserMessage({ content: [{ type: 'text', text: 'please ask-user-late-read now' }], source: { kind: 'user' } }))
   await settle(() => {
     const live = adapter.live.get('s1')
@@ -291,7 +308,6 @@ test('answering ask_user with a late read_own_chat and runtime context sends one
       && [...live.pending.values()][0]?.name === 'read_own_chat'
   }, 5000, 'card must be saved while late read_own_chat waits in pending')
 
-  const readRecords = () => readFileSync(recordPath, 'utf8').trim().split('\n').filter(Boolean).map(line => JSON.parse(line))
   const promptsBeforeAnswer = readRecords().filter(entry => entry.event === 'prompt').length
   assert.equal(promptsBeforeAnswer, 1, 'initial question turn sent exactly one ACP prompt')
 
@@ -361,4 +377,88 @@ test('answering ask_user with a late read_own_chat and runtime context sends one
   assert.equal(secondAnswerMessages.length, 1, 'second answer turn produced one assistant message')
   const secondTextBlocks = (secondAnswerMessages[0]?.content ?? []).filter(block => block.type === 'text')
   assert.equal(secondTextBlocks.length, 1, `expected 1 text block after prior-tool card answer, got ${secondTextBlocks.length}: ${JSON.stringify(secondTextBlocks)}`)
+})
+
+test('the DS Bot context steward switches parts with an open question and delivers its answer once', async (t) => {
+  const { agent, rt, ctx, adapter, archived, readRecords, lastRequest } = await recordedAskUserLoop(t)
+  const oldSessionId = agent.id
+  agent.followup(createUserMessage({
+    content: [{ type: 'text', text: 'please ask-user-late-read now' }],
+    source: { kind: 'user' },
+  }))
+  await settle(() => rt.state.questions[oldSessionId] !== undefined
+    && agent.session.snapshotEvents().some(event => event.type === 'turn/end')
+    && agent.status === 'idle', 5000, 'the first part must be idle with an open card')
+  const question = rt.state.questions[oldSessionId]
+  assert.ok(question.callId)
+  const oldPrompt = readRecords().find(entry => entry.event === 'prompt')
+  assert.ok(oldPrompt)
+
+  const stewardCalls = []
+  const localContext = rt.localAgentContext
+  rt.localAgentContext = id => id === oldSessionId ? { used: 220_000, size: 262_000, compactions: 0 } : localContext(id)
+  rt.localAgentAsk = async id => {
+    stewardCalls.push(id)
+    return JSON.stringify({ action: 'switch', reason: 'context is full' })
+  }
+  const handoffMarker = 'ACP042-SWITCH-HANDOFF'
+  rt.localAgentNote = async () => ['Goals', 'Constraints and preferences', 'Progress', 'Decisions',
+    'Facts to keep', 'Open threads', 'Next step', 'Where to look']
+    .map(section => `## ${section}\n- ${section === 'Goals' ? handoffMarker : 'Keep the open question.'}`).join('\n\n')
+
+  for (const listener of ctx.listeners.get('agent/status')) listener({ agent, status: 'idle' })
+  await settle(() => archived.includes(oldSessionId), 5000, 'DS Bot must archive the old part after switching')
+
+  const freshSessionId = rt.chatOf('a')
+  assert.notEqual(freshSessionId, oldSessionId)
+  assert.deepEqual(stewardCalls, [oldSessionId])
+  assert.equal(rt.state.questions[oldSessionId], undefined)
+  const carried = rt.state.questions[freshSessionId]
+  assert.equal(carried?.id, question.id)
+  assert.equal(carried.callId, question.callId)
+  assert.equal(carried.callSessionId, oldSessionId)
+  assert.equal(adapter.live.has(oldSessionId), false, 'the old part releases its ACP session')
+
+  const fresh = await rt.resolveAgent(freshSessionId)
+  await settle(() => fresh.session.snapshotEvents().some(event => event.type === 'turn/end') && fresh.status === 'idle',
+    5000, 'the handoff must finish before answering')
+  const before = fresh.session.snapshotEvents()
+  const handoffs = before.filter(event => event.type === 'user/message' && event.data?.source?.handoff === true)
+  assert.equal(handoffs.length, 1)
+  assert.match(textOf(handoffs[0].data.content), /ACP042-SWITCH-HANDOFF/)
+  const promptCount = readRecords().filter(entry => entry.event === 'prompt').length
+
+  await rt.answerQuestion(freshSessionId, question.id, { selected: ['Pass'] })
+  const events = () => fresh.session.snapshotEvents().slice(before.length)
+  await settle(() => events().some(event => event.type === 'turn/end') && fresh.status === 'idle',
+    5000, 'the answer turn must finish in the fresh part')
+
+  const replies = events().filter(event => event.type === 'user/message' && event.data?.source?.kind === 'user-question-reply')
+  assert.deepEqual(replies.map(event => event.data.source.callId), [question.callId])
+  assert.equal(agent.session.snapshotEvents().some(event => event.type === 'user/message' && event.data?.source?.kind === 'user-question-reply'), false)
+  assert.equal(rt.state.questions[freshSessionId], undefined)
+  const prompts = readRecords().filter(entry => entry.event === 'prompt').slice(promptCount)
+  assert.equal(prompts.length, 1, 'the answer must not send a standalone context prompt')
+  assert.notDeepEqual([prompts[0].pid, prompts[0].sessionId], [oldPrompt.pid, oldPrompt.sessionId])
+  assert.equal(prompts[0].text.split(question.callId).length - 1, 1, 'the original callId appears once in the ACP answer')
+  assert.match(prompts[0].text, /^Current time: /m, 'the answer carries its context snapshot')
+  assert.equal(events().find(event => event.type === 'turn/end').data.reason.kind, 'completed')
+  assert.equal(events().filter(event => event.type === 'assistant/message')
+    .flatMap(event => event.data.message.content.filter(block => block.type === 'text')).length, 1)
+
+  const last = lastRequest.get(freshSessionId)
+  assert.ok(last, 'capture the real request that carried the answer')
+  const clock = 'Current time: late snapshot after the switch.'
+  const snapshot = createUserMessage({
+    content: [{ type: 'text', text: clock }],
+    source: { kind: 'ds-bot-time-context', form: 'snapshot', sections: [{ name: 'ds-bot-time-context', text: clock }] },
+  })
+  const chunks = []
+  for await (const chunk of adapter.stream({
+    ...last, messages: [...last.messages, snapshot], signal: AbortSignal.timeout(5000),
+  })) chunks.push(chunk)
+  const contextPrompts = readRecords().filter(entry => entry.event === 'prompt').slice(promptCount + 1)
+  assert.deepEqual(contextPrompts.map(entry => entry.text), [], 'a late context snapshot must not start a second ACP prompt')
+  assert.deepEqual(chunks.map(chunk => chunk.type), ['finish'])
+  assert.equal(chunks[0].reason.kind, 'stop')
 })

@@ -52,6 +52,8 @@ const WINDOW = 262_000
 const MODES = agyModes ? ['default', 'accept-edits', 'auto', 'plan'] : cursorModes ? ['agent', 'plan', 'ask'] : ['ask', 'accept-edits', 'bypass']
 let refusedModes = 0
 const sessions = new Map()
+let isolationA
+let lateOldPermission
 let nextId = 0
 if (stateFile) {
   try {
@@ -185,7 +187,70 @@ async function runPrompt(session, prompt, requestId) {
     }, 20)
     return
   }
+  if (text.includes('cancel-second')) { finish('ok: cancel-second'); return }
+  if (text.includes('cancel-third')) { finish('ok: cancel-third'); return }
+  if (text.includes('after-answer')) { finish('ok: after-answer'); return }
+  if (text.includes('after-again')) { finish('ok: after-again'); return }
+  if (text.includes('after-retire')) { finish('ok: after-retire'); return }
+  if (text.includes('next clean')) { finish('ok: next clean'); return }
+  if (text.includes('marker-b')) { finish('ok: marker-b'); return }
+  if (text.includes('marker-c')) { finish('ok: marker-c'); return }
+  if (text.includes('late-permission-error') && !text.includes('[Runtime handoff]')) {
+    lateOldPermission = sessionId
+    send({ jsonrpc: '2.0', id: requestId, error: { code: -32021, message: 'The model ended its turn without a response. Send a message to continue.' } })
+    return
+  }
+  if (text.includes('late-permission-b')) {
+    if (lateOldPermission !== undefined) {
+      const oldId = lateOldPermission
+      lateOldPermission = undefined
+      void ask('session/request_permission', { sessionId: oldId, toolCall: { toolCallId: 'late-old-permission', kind: 'execute', title: 'late old permission' }, options: [{ optionId: 'allow-once', name: 'Allow once', kind: 'allow_once' }] }).then((message) => {
+        if (recordFile) appendFileSync(recordFile, `${JSON.stringify({ event: 'late-permission-result', oldSessionId: oldId, outcome: message.result?.outcome?.outcome ?? 'error' })}\n`)
+      })
+    }
+    finish('ok: late-permission-b')
+    return
+  }
+  if (text.includes('retire-mcp-error') && !text.includes('[Runtime handoff]')) {
+    send({ jsonrpc: '2.0', id: requestId, error: { code: -32021, message: 'The model ended its turn without a response. Send a message to continue.' } })
+    setTimeout(() => {
+      void mcpCall(session.mcp, 'message_bot', { bot: 'review-only', text: 'old failed turn' }).then((result) => {
+        if (recordFile) appendFileSync(recordFile, `${JSON.stringify({ event: 'retired-mcp-result', sessionId, isError: result?.isError === true, text: (result?.content ?? []).map(block => block.text ?? '').join('') })}\n`)
+      }, (error) => {
+        if (recordFile) appendFileSync(recordFile, `${JSON.stringify({ event: 'retired-mcp-result', sessionId, isError: true, text: error.message })}\n`)
+      })
+      void ask('session/request_permission', { sessionId, toolCall: { toolCallId: 'retired-old-permission', kind: 'execute', title: 'old failed turn permission' }, options: [{ optionId: 'allow-once', name: 'Allow once', kind: 'allow_once' }] }).then((message) => {
+        if (recordFile) appendFileSync(recordFile, `${JSON.stringify({ event: 'retired-permission-result', sessionId, outcome: message.result?.outcome?.outcome ?? 'error' })}\n`)
+      })
+    }, 20)
+    return
+  }
+  if (text.includes('isolation-a') && !text.includes('[Runtime handoff]')) {
+    isolationA = sessionId
+    send({ jsonrpc: '2.0', id: requestId, error: { code: -32021, message: 'The model ended its turn without a response. Send a message to continue.' } })
+    return
+  }
+  if (text.includes('isolation-b')) {
+    if (isolationA !== undefined) {
+      update(isolationA, { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'old-a-text' } })
+      isolationA = undefined
+    }
+    finish('marker-b-only')
+    return
+  }
+  if (text.includes('rpc-error-once') && !text.includes('[Runtime handoff]')) {
+    send({ jsonrpc: '2.0', id: requestId, error: { code: -32021, message: 'The model ended its turn without a response. Send a message to continue.' } })
+    return
+  }
   if (text.includes('rpc-error-number')) { send({ jsonrpc: '2.0', id: requestId, error: { code: -32603, message: 'Internal error: approval was cancelled' } }); return }
+  if (text.includes('stale-error') && !text.includes('[Runtime handoff]')) {
+    send({ jsonrpc: '2.0', id: requestId, error: { code: -32021, message: 'The model ended its turn without a response. Send a message to continue.' } })
+    setTimeout(() => {
+      update(sessionId, { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'stale-output' } })
+      update(sessionId, { sessionUpdate: 'usage_update', used: 123_456, size: WINDOW })
+    }, 20)
+    return
+  }
   if (text.includes('rpc-error-empty')) { send({ jsonrpc: '2.0', id: requestId, error: { code: '', message: 'Internal error: empty code' } }); return }
   if (text.includes('rpc-error-object')) { send({ jsonrpc: '2.0', id: requestId, error: { code: -32603, message: { reason: 'stopped' } } }); return }
   if (text.includes('count-sessions')) { finish(`sessions: ${sessions.size}`); return }
@@ -339,7 +404,7 @@ async function runPrompt(session, prompt, requestId) {
   update(sessionId, { sessionUpdate: 'tool_call', toolCallId: 't1', kind: 'execute', status: 'in_progress', rawInput: { command: 'npm test' } })
   update(sessionId, { sessionUpdate: 'tool_call_update', toolCallId: 't1', status: 'completed' })
   const suffix = images.length > 0 ? ` images=${JSON.stringify(images.map(block => ({ mimeType: block.mimeType, data: block.data })))}` : ''
-  finish(`ok: ${text.slice(0, 60)}${suffix}`)
+  finish(`ok: ${text.slice(0, 500)}${suffix}`)
 }
 
 let rest = ''
@@ -472,7 +537,7 @@ process.stdin.on('data', (chunk) => {
       case 'session/prompt':
         if (recordFile) {
           const promptText = (params.prompt ?? []).filter(block => block.type === 'text').map(block => block.text ?? '').join('\n')
-          appendFileSync(recordFile, `${JSON.stringify({ event: 'prompt', sessionId: params.sessionId, id, text: promptText })}\n`)
+          appendFileSync(recordFile, `${JSON.stringify({ event: 'prompt', sessionId: params.sessionId, pid: process.pid, id, text: promptText })}\n`)
         }
         if (lateCancelReply) {
           const session = sessions.get(params.sessionId)

@@ -240,14 +240,14 @@ test('acp: a missing cancel acknowledgement cannot freeze subsequent turns', asy
     const oldId = peer.nextId
     control.abort()
     assert.equal((await stopped).finish.kind, 'aborted')
-    const messages = [user('m0', 'hello'), user('m1', 'hang'), user('m2', 'second')]
-    const next = await collect(adapter.stream(options('s1', messages, { signal: AbortSignal.timeout(1000) })))
+    const messages = [user('m0', 'hello'), user('m1', 'hang'), user('m2', 'cancel-second')]
+    const next = await collect(adapter.stream(options('s1', messages, { signal: AbortSignal.timeout(5000) })))
     assert.equal(next.finish.kind, 'stop')
-    assert.equal(next.text, 'ok: second')
+    assert.equal(next.text, 'ok: cancel-second')
     assert.equal(peer.pending.has(oldId), false)
-    messages.push(user('m3', 'third'))
+    messages.push(user('m3', 'cancel-third'))
     const third = await collect(adapter.stream(options('s1', messages)))
-    assert.equal(third.text, 'ok: third')
+    assert.equal(third.text, 'ok: cancel-third')
     assert.equal(third.finish.kind, 'stop')
   })
 })
@@ -1180,6 +1180,87 @@ test('codex app-server: a late notice for an earlier turn keeps the running turn
   assert.equal(steer.params.expectedTurnId, second, 'the next input steers the running turn')
 })
 
+test('in-place compaction followed by ask_user merges trailing clock context without extra prompts', { timeout: 8000 }, async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsb-acp-compact-card-'))
+  const recordPath = join(dir, 'record.jsonl')
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  const adapter = makeAdapter({ acpArgs: [`--record=${recordPath}`] })
+  t.after(() => adapter.dispose())
+  const clock = (id, text) => ({ id, role: 'user', content: [{ type: 'text', text }], source: { kind: 'ds-bot-time-context', form: 'snapshot', sections: [{ name: 'ds-bot-time-context', text }] } })
+  const messages = [user('m1', 'hello')]
+  const first = await collect(adapter.stream(options('s1', messages)))
+  assert.equal(first.finish.kind, 'stop')
+  assert.equal(await adapter.compact('s1', AbortSignal.timeout(5000)), 'done')
+  const baselinePrompts = readFileSync(recordPath, 'utf8').trim().split('\n').filter(Boolean).map(line => JSON.parse(line)).filter(entry => entry.event === 'prompt')
+  assert.equal(baselinePrompts.length, 2, 'hello plus /compact are the baseline prompts')
+
+  messages.push(
+    { id: 'a1', role: 'assistant', content: [{ type: 'text', text: first.text }] },
+    user('m2', 'please ask-user-late-read now'),
+    clock('c1', 'Current time: compact clock one.'),
+  )
+  const cardTurn = await collect(adapter.stream(options('s1', messages)))
+  assert.equal(cardTurn.finish.kind, 'tool-calls')
+  assert.equal(cardTurn.calls.filter(call => call.name === 'ask_user').length, 1)
+  const askCall = cardTurn.calls.find(call => call.name === 'ask_user')
+  adapter.questionShown('s1', askCall.id, { id: 'q-compact', question: 'Approve ACP042?', options: [{ label: 'Pass' }, { label: 'Fail' }] })
+  const live = adapter.live.get('s1')
+  for (let attempt = 0; attempt < 200 && ![...live.pending.values()].some(entry => entry.name === 'read_own_chat'); attempt += 1) {
+    await new Promise(resolve => setTimeout(resolve, 5))
+  }
+  assert.ok([...live.pending.values()].some(entry => entry.name === 'read_own_chat'), 'late read_own_chat is pending behind the card')
+
+  const built = questionReply({ id: 'q-compact', callId: askCall.id, question: 'Approve ACP042?', options: [{ label: 'Pass' }, { label: 'Fail' }] }, { selected: ['Pass'] })
+  messages.push(
+    { id: 'm3', role: 'user', content: [{ type: 'text', text: built.text }], source: built.source },
+    clock('c2', 'Current time: compact clock two.'),
+  )
+  const answerTurn = await collect(adapter.stream(options('s1', messages)))
+  assert.equal(answerTurn.finish.kind, 'stop')
+  const prompts = readFileSync(recordPath, 'utf8').trim().split('\n').filter(Boolean).map(line => JSON.parse(line)).filter(entry => entry.event === 'prompt')
+  assert.equal(prompts.length, 4, `expected hello, compact, card, answer; got ${prompts.length}: ${JSON.stringify(prompts.map(entry => entry.text))}`)
+  assert.equal(prompts.every(entry => entry.sessionId === prompts[0].sessionId), true, 'a clean compact/card flow reuses the same CLI session')
+  assert.equal((prompts[2].text.match(/compact clock one/g) ?? []).length, 1, 'first clock attaches once to the card prompt')
+  assert.equal((prompts[3].text.match(/compact clock two/g) ?? []).length, 1, 'second clock attaches once to the answer prompt')
+  assert.equal(prompts[3].text.includes(askCall.id), true, 'the answer keeps its original callId')
+  assert.doesNotMatch(answerTurn.text, /Context compacted/)
+})
+
+test('pure time and runtime context updates never start their own ACP prompt', async (t) => {
+  for (const kind of ['runtime-context', 'time-context', 'ds-bot-time-context']) {
+    const dir = mkdtempSync(join(tmpdir(), 'dsb-acp-context-only-'))
+    const recordPath = join(dir, 'record.jsonl')
+    t.after(() => rmSync(dir, { recursive: true, force: true }))
+    const adapter = makeAdapter({ acpArgs: [`--record=${recordPath}`] })
+    t.after(() => adapter.dispose())
+    const messages = [user('m1', 'hello')]
+    await collect(adapter.stream(options('s1', messages)))
+    const source = kind === 'ds-bot-time-context'
+      ? { kind, form: 'snapshot', sections: [{ name: kind, text: 'Current time: controlled fixture clock.' }] }
+      : { kind }
+    messages.push({ id: `c-${kind}`, role: 'user', content: [{ type: 'text', text: 'Current time: controlled fixture clock.' }], source })
+    const result = await collect(adapter.stream(options('s1', messages)))
+    assert.equal(result.finish.kind, 'stop')
+    const prompts = readFileSync(recordPath, 'utf8').trim().split('\n').filter(Boolean).map(line => JSON.parse(line)).filter(entry => entry.event === 'prompt')
+    assert.equal(prompts.length, 1, `${kind} opened an independent ACP prompt: ${JSON.stringify(prompts)}`)
+  }
+})
+
+test('a user personally typing a clock-shaped message still starts an ACP prompt', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsb-acp-user-clock-'))
+  const recordPath = join(dir, 'record.jsonl')
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  const adapter = makeAdapter({ acpArgs: [`--record=${recordPath}`] })
+  t.after(() => adapter.dispose())
+  const messages = [user('m1', 'hello')]
+  await collect(adapter.stream(options('s1', messages)))
+  messages.push(user('m2', 'Current time: controlled fixture clock.'))
+  await collect(adapter.stream(options('s1', messages)))
+  const prompts = readFileSync(recordPath, 'utf8').trim().split('\n').filter(Boolean).map(line => JSON.parse(line)).filter(entry => entry.event === 'prompt')
+  assert.equal(prompts.length, 2)
+  assert.match(prompts[1].text, /Current time: controlled fixture clock/)
+})
+
 test('codex app-server: the approval answer rides along with runtime context in the new turn', async (t) => {
   const recordPath = join(mkdtempSync(join(tmpdir(), 'dsb-settled-')), 'record.jsonl')
   const adapter = makeAdapter({ codexArgs: ['--record', recordPath] })
@@ -1340,6 +1421,174 @@ test('a late ACP decision discards old output and drains a continuation that ask
   messages.push(toolResult('m3', second.calls[0].id, '{"decision":"allow"}'))
   const third = await collect(adapter.stream(options('s1', messages)))
   assert.match(third.text, /allowed via allow-once/)
+})
+
+test('a failed ACP session is retired before the next prompt and late old output stays unrouted', { timeout: 5000 }, async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsb-acp-isolate-'))
+  const recordPath = join(dir, 'record.jsonl')
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  const adapter = makeAdapter({ acpArgs: [`--record=${recordPath}`] })
+  t.after(() => adapter.dispose())
+  const messages = [user('m1', 'isolation-a')]
+  await assert.rejects(() => collect(adapter.stream(options('s1', messages))), /ended its turn without a response/)
+  messages.push(user('m2', 'isolation-b'))
+  const second = await collect(adapter.stream(options('s1', messages)))
+  assert.match(second.text, /marker-b-only/)
+  assert.doesNotMatch(second.text, /old-a-text/)
+  const prompts = readFileSync(recordPath, 'utf8').trim().split('\n').filter(Boolean).map(line => JSON.parse(line))
+  assert.equal(prompts.length, 2)
+  assert.notEqual(prompts[0].sessionId, prompts[1].sessionId)
+  assert.match(prompts[1].text, /\[Runtime handoff\]/)
+  assert.match(prompts[1].text, /New input:/)
+})
+
+test('a healthy ACP turn reuses its session without a runtime handoff', { timeout: 5000 }, async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsb-acp-reuse-'))
+  const recordPath = join(dir, 'record.jsonl')
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  const adapter = makeAdapter({ acpArgs: [`--record=${recordPath}`] })
+  t.after(() => adapter.dispose())
+  const messages = [user('m1', 'reuse-a')]
+  await collect(adapter.stream(options('s1', messages)))
+  messages.push(user('m2', 'reuse-b'))
+  await collect(adapter.stream(options('s1', messages)))
+  const prompts = readFileSync(recordPath, 'utf8').trim().split('\n').filter(Boolean).map(line => JSON.parse(line))
+  assert.equal(prompts.length, 2)
+  assert.equal(prompts[0].sessionId, prompts[1].sessionId)
+  assert.doesNotMatch(prompts[1].text, /\[Runtime handoff\]/)
+})
+
+test('a restarted host still retires a poisoned ACP session instead of resuming it', { timeout: 5000 }, async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsb-acp-retire-restart-'))
+  const recordPath = join(dir, 'record.jsonl')
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  const records = {}
+  const firstAdapter = makeAdapter({ records, acpArgs: [`--record=${recordPath}`] })
+  const messages = [user('m1', 'isolation-a')]
+  await assert.rejects(() => collect(firstAdapter.stream(options('s1', messages))), /ended its turn without a response/)
+  assert.equal(records.s1.acpRetired, true)
+  assert.ok(records.s1.retiredReplay !== undefined)
+  await firstAdapter.dispose()
+
+  const secondAdapter = makeAdapter({ records, acpArgs: [`--record=${recordPath}`] })
+  t.after(() => secondAdapter.dispose())
+  messages.push(user('m2', 'isolation-b'))
+  const second = await collect(secondAdapter.stream(options('s1', messages)))
+  assert.equal(second.finish.kind, 'stop')
+  assert.equal(second.text, 'marker-b-only')
+  const prompts = readFileSync(recordPath, 'utf8').trim().split('\n').filter(Boolean).map(line => JSON.parse(line))
+  assert.equal(prompts.length, 2)
+  assert.notEqual(`${prompts[0].pid}:${prompts[0].sessionId}`, `${prompts[1].pid}:${prompts[1].sessionId}`)
+  assert.match(prompts[1].text, /\[Runtime handoff\]/)
+})
+
+test('a question reply in a failed ACP prompt is carried once into the retired session', { timeout: 5000 }, async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsb-acp-carry-'))
+  const recordPath = join(dir, 'record.jsonl')
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  const adapter = makeAdapter({ acpArgs: [`--record=${recordPath}`] })
+  t.after(() => adapter.dispose())
+  const built = questionReply({ id: 'q-retry', callId: 'ask-retry', question: 'rpc-error-once?', options: [{ label: 'Yes' }, { label: 'No' }] }, { selected: ['Yes'] })
+  const answer = { id: 'm1', role: 'user', content: [{ type: 'text', text: built.text }], source: built.source }
+  const messages = [answer]
+  await assert.rejects(() => collect(adapter.stream(options('s1', messages))), /ended its turn without a response/)
+  messages.push(user('m2', 'after-answer'))
+  const second = await collect(adapter.stream(options('s1', messages)))
+  assert.match(second.text, /ok: after-answer/)
+  messages.push(user('m3', 'after-again'))
+  await collect(adapter.stream(options('s1', messages)))
+  const prompts = readFileSync(recordPath, 'utf8').trim().split('\n').filter(Boolean).map(line => JSON.parse(line))
+  assert.equal(prompts.length, 3)
+  assert.notEqual(prompts[0].sessionId, prompts[1].sessionId)
+  assert.equal(prompts[1].sessionId, prompts[2].sessionId)
+  assert.match(prompts[1].text, /Unanswered user decisions to act on once:/)
+  assert.match(prompts[1].text, /ask-retry/)
+  assert.doesNotMatch(prompts[2].text, /ask-retry/)
+})
+
+test('a permission from the retired ACP session after the next prompt starts cannot occupy it', { timeout: 5000 }, async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsb-acp-late-permission-'))
+  const recordPath = join(dir, 'record.jsonl')
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  const adapter = makeAdapter({ acpArgs: [`--record=${recordPath}`] })
+  t.after(() => adapter.dispose())
+  const messages = [user('m1', 'late-permission-error')]
+  await assert.rejects(() => collect(adapter.stream(options('s1', messages))), /ended its turn without a response/)
+  messages.push(user('m2', 'late-permission-b'))
+  const second = await collect(adapter.stream(options('s1', messages)))
+  assert.equal(second.finish.kind, 'stop')
+  assert.equal(second.calls.length, 0)
+  assert.equal(second.text, 'ok: late-permission-b')
+  for (let attempt = 0; attempt < 100 && !readFileSync(recordPath, 'utf8').includes('late-permission-result'); attempt += 1) {
+    await new Promise(resolve => setTimeout(resolve, 5))
+  }
+  const rows = readFileSync(recordPath, 'utf8').trim().split('\n').filter(Boolean).map(line => JSON.parse(line))
+  const prompts = rows.filter(row => row.event === 'prompt')
+  const late = rows.find(row => row.event === 'late-permission-result')
+  assert.equal(prompts.length, 2)
+  assert.notEqual(prompts[0].sessionId, prompts[1].sessionId)
+  assert.equal(late?.oldSessionId, prompts[0].sessionId)
+  assert.equal(late?.outcome, 'error')
+})
+
+test('retiring a failed ACP session refuses its unsurfaced calls and rotates the MCP route', { timeout: 5000 }, async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsb-acp-retire-calls-'))
+  const recordPath = join(dir, 'record.jsonl')
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  const adapter = makeAdapter({ acpArgs: [`--record=${recordPath}`] })
+  t.after(() => adapter.dispose())
+  const messages = [user('m1', 'retire-mcp-error')]
+  await assert.rejects(() => collect(adapter.stream(options('s1', messages))), /ended its turn without a response/)
+  const live = adapter.live.get('s1')
+  for (let attempt = 0; attempt < 200 && !(live.events.some(event => event.type === 'call') && live.events.some(event => event.type === 'permission')); attempt += 1) {
+    await new Promise(resolve => setTimeout(resolve, 5))
+  }
+  assert.ok(live.events.some(event => event.type === 'call'), 'the old MCP call arrived before retirement')
+  assert.ok(live.events.some(event => event.type === 'permission'), 'the old permission arrived before retirement')
+  messages.push(user('m2', 'after-retire'))
+  const second = await collect(adapter.stream(options('s1', messages)))
+  assert.equal(second.finish.kind, 'stop')
+  assert.equal(second.calls.length, 0)
+  assert.match(second.text, /ok: after-retire/)
+  const rows = readFileSync(recordPath, 'utf8').trim().split('\n').filter(Boolean).map(line => JSON.parse(line))
+  const mcpResult = rows.find(row => row.event === 'retired-mcp-result')
+  const permissionResult = rows.find(row => row.event === 'retired-permission-result')
+  assert.equal(mcpResult?.isError, true)
+  assert.match(mcpResult?.text ?? '', /retired after a failed turn|session closed/)
+  assert.equal(permissionResult?.outcome, 'cancelled')
+  const prompts = rows.filter(row => row.event === 'prompt')
+  assert.equal(prompts.length, 2)
+  assert.notEqual(prompts[0].sessionId, prompts[1].sessionId)
+})
+
+test('an ACP prompt error settles once and the next prompts keep their own replies', { timeout: 5000 }, async (t) => {
+  const adapter = makeAdapter()
+  t.after(() => adapter.dispose())
+  const messages = [user('m1', 'rpc-error-once')]
+  await assert.rejects(() => collect(adapter.stream(options('s1', messages))), /ended its turn without a response/)
+  messages.push(user('m2', 'marker-b'))
+  const second = await collect(adapter.stream(options('s1', messages)))
+  assert.match(second.text, /ok: marker-b/)
+  messages.push(user('m3', 'marker-c'))
+  const third = await collect(adapter.stream(options('s1', messages)))
+  assert.match(third.text, /ok: marker-c/)
+})
+
+test('late ACP output and a stale terminal after a failed prompt do not answer the next prompt', { timeout: 5000 }, async (t) => {
+  const adapter = makeAdapter()
+  t.after(() => adapter.dispose())
+  const messages = [user('m1', 'stale-error')]
+  await assert.rejects(() => collect(adapter.stream(options('s1', messages))), /ended its turn without a response/)
+  for (let attempt = 0; attempt < 200 && adapter.live.get('s1')?.context?.used !== 123_456; attempt += 1) {
+    await new Promise(resolve => setTimeout(resolve, 5))
+  }
+  assert.equal(adapter.live.get('s1')?.context?.used, 123_456)
+  adapter.live.get('s1')?.push({ type: 'error', error: new Error('stale terminal') })
+  messages.push(user('m2', 'next clean'))
+  const second = await collect(adapter.stream(options('s1', messages)))
+  assert.doesNotMatch(second.text, /stale-output/)
+  assert.match(second.text, /ok: next clean/)
+  assert.equal(second.finish.kind, 'stop')
 })
 
 test('replacing a completed Codex turn retains another queued approval', { timeout: 5000 }, async (t) => {
@@ -1855,6 +2104,27 @@ test('codex receives image blocks on first replay turn, delta turn, and image-on
   const second = await collect(adapter.stream(options('s1', [imageMsg('m1', 'describe this', pngRef), imageMsg('m2', undefined, jpgRef)], { provider: 'local-codex-cli', model: 'gpt-5.1-codex' })))
   assert.equal(second.finish?.kind, 'stop')
   assert.match(second.text, new RegExp(`data:image/jpeg;base64,${jpgBytes.toString('base64')}`))
+})
+
+test('claude: a pre-init exit during image resolution still fails the turn', async (t) => {
+  let adapter
+  const pngBytes = Buffer.from('exit-image')
+  const attachments = {
+    async readImage(ref) {
+      adapter.live.get('s1')?.engineSession?.child.kill()
+      await new Promise(resolve => setTimeout(resolve, 20))
+      return { ref, data: pngBytes }
+    },
+    imageHostPath: () => undefined,
+  }
+  adapter = makeAdapter({ claude: FIXTURE('fake-claude-lazy-init.mjs'), attachments })
+  t.after(() => adapter.dispose())
+  const ref = { attachmentId: 'att-exit', mediaType: 'image/png', bytes: pngBytes.length, width: 1, height: 1 }
+  await assert.rejects(
+    collect(adapter.stream(options('s1', [imageMsg('m1', 'check screenshot', ref)], { provider: 'local-claude-code', signal: AbortSignal.timeout(5000) }))),
+    error => error.code === 'LOCAL_AGENT_EXIT',
+  )
+  assert.equal(adapter.live.get('s1')?.handed, undefined, 'the unread image prompt is replayed after the failure')
 })
 
 test('claude receives Anthropic base64 image blocks for text+image and image-only turns', async (t) => {
